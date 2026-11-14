@@ -37,4 +37,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: apk
-          path: v2rayNG-master/V2rayNG/app/build/outputs/apk/
+          path: v2rayNG-master/V2rayNG/app/build/outputs/apk/**/*armeabi-v7a*.apk
+          if-no-files-found: error
