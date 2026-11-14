@@ -26,19 +26,36 @@ jobs:
           test -s "$SRC_DIR/compile-hevtun.sh"
           echo "PHANTOM_SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
-        with:
-          log-accepted-android-sdk-licenses: false
-          cmdline-tools-version: '14742923'
-          packages: 'platforms;android-37 build-tools;37.0.0 platform-tools'
-
-      - name: Install Android NDK
+      - name: Setup Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --channel=0 --install "ndk;30.0.16248370"
-          echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> "$GITHUB_ENV"
+          SDK_ROOT="$HOME/android-sdk"
+          CMDLINE_REV="15859902"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          curl -fL --retry 3 --retry-delay 2 -o /tmp/commandlinetools.zip \
+            "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_REV}_latest.zip"
+          rm -rf "$SDK_ROOT/cmdline-tools/latest" "$SDK_ROOT/cmdline-tools/cmdline-tools"
+          unzip -q /tmp/commandlinetools.zip -d "$SDK_ROOT/cmdline-tools"
+          mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          # The old package id "platforms;android-37" does not exist.
+          # API 37 is published as platforms;android-37.0 (see repository2-3.xml).
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0" \
+            "platform-tools" \
+            "ndk;30.0.16248370"
+          if [ ! -d "$SDK_ROOT/platforms/android-37.0" ] && [ ! -d "$SDK_ROOT/platforms/android-37" ]; then
+            echo "Android 37 platform was not installed. Installed platforms:"
+            ls -la "$SDK_ROOT/platforms" || true
+            exit 1
+          fi
+          test -d "$SDK_ROOT/ndk/30.0.16248370"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK_ROOT/ndk/30.0.16248370" >> "$GITHUB_ENV"
 
       - name: Fetch pinned HEV JNI source and dependencies
         env:
@@ -89,20 +106,58 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Build Phantom armeabi-v7a debug APK
+      - name: Prepare release keystore
+        shell: bash
+        env:
+          APP_KEYSTORE_BASE64: ${{ secrets.APP_KEYSTORE_BASE64 }}
+          APP_KEYSTORE_PASSWORD: ${{ secrets.APP_KEYSTORE_PASSWORD }}
+          APP_KEYSTORE_ALIAS: ${{ secrets.APP_KEYSTORE_ALIAS }}
+          APP_KEY_PASSWORD: ${{ secrets.APP_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/signing-out"
+          KS="$GITHUB_WORKSPACE/signing-out/phantom.jks"
+          if [ -n "${APP_KEYSTORE_BASE64:-}" ]; then
+            printf '%s' "$APP_KEYSTORE_BASE64" | base64 -d > "$KS"
+            test -n "${APP_KEYSTORE_PASSWORD:-}" && test -n "${APP_KEYSTORE_ALIAS:-}" && test -n "${APP_KEY_PASSWORD:-}"
+            printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+              "$APP_KEYSTORE_PASSWORD" "$APP_KEYSTORE_ALIAS" "$APP_KEY_PASSWORD" \
+              > "$GITHUB_WORKSPACE/signing-out/keystore.props"
+            echo "EPHEMERAL_KEYSTORE=false" >> "$GITHUB_ENV"
+          else
+            STORE_PASS="$(openssl rand -base64 18 | tr -d '\n')"
+            keytool -genkeypair -keystore "$KS" -storepass "$STORE_PASS" -keypass "$STORE_PASS" \
+              -alias phantom -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Phantom, OU=Android, O=Phantom, L=NA, ST=NA, C=US"
+            printf 'storePassword=%s\nkeyAlias=phantom\nkeyPassword=%s\n' \
+              "$STORE_PASS" "$STORE_PASS" > "$GITHUB_WORKSPACE/signing-out/keystore.props"
+            echo "EPHEMERAL_KEYSTORE=true" >> "$GITHUB_ENV"
+            echo "No signing secrets found. Generated a new keystore; download the private artifact or later updates will not install over this APK."
+          fi
+          echo "KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
+
+      - name: Build Phantom armeabi-v7a release APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$PHANTOM_SRC_DIR/V2rayNG"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
-          ./gradlew --no-daemon :app:assemblePlaystoreDebug -PABI_FILTERS=armeabi-v7a
+          PROPS="$GITHUB_WORKSPACE/signing-out/keystore.props"
+          STORE_PASS="$(sed -n 's/^storePassword=//p' "$PROPS")"
+          KEY_ALIAS="$(sed -n 's/^keyAlias=//p' "$PROPS")"
+          KEY_PASS="$(sed -n 's/^keyPassword=//p' "$PROPS")"
+          ./gradlew --no-daemon :app:assemblePlaystoreRelease -PABI_FILTERS=armeabi-v7a \
+            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
+            -Pandroid.injected.signing.store.password="$STORE_PASS" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASS"
 
-      - name: Verify native libraries are packaged in APK
+      - name: Verify native libraries and R8 obfuscation
         shell: bash
         run: |
           set -euo pipefail
-          APK=$(find "$PHANTOM_SRC_DIR/V2rayNG/app/build/outputs/apk/playstore/debug" -maxdepth 1 -type f -name '*armeabi-v7a*.apk' | head -n 1)
+          APK=$(find "$PHANTOM_SRC_DIR/V2rayNG/app/build/outputs/apk/playstore/release" -maxdepth 1 -type f -name '*armeabi-v7a*.apk' | head -n 1)
           test -n "$APK"
           unzip -Z1 "$APK" | grep -Fx 'lib/armeabi-v7a/libhev-socks5-tunnel.so'
           unzip -Z1 "$APK" | grep -Fx 'lib/armeabi-v7a/libhevsockstun.so'
@@ -111,12 +166,42 @@ jobs:
             apk_lib="lib/${aar_lib#jni/}"
             unzip -Z1 "$APK" | grep -Fx "$apk_lib"
           done < <(unzip -Z1 "$AAR" | grep -E '^jni/armeabi-v7a/[^/]+\.so$')
-          echo "Verified APK: $APK"
+          MAP="$PHANTOM_SRC_DIR/V2rayNG/app/build/outputs/mapping/playstoreRelease/mapping.txt"
+          test -s "$MAP"
+          python3 - "$MAP" <<'PY'
+          import sys
+          text = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+          renamed = [line for line in text if line.startswith("com.v2ray.ang.handler.MmkvManager -> ")]
+          if not renamed:
+              sys.exit("R8 mapping has no MmkvManager entry; minify did not run")
+          target = renamed[0].split("->", 1)[1].strip().rstrip(":")
+          if target == "com.v2ray.ang.handler.MmkvManager":
+              sys.exit("MmkvManager was not renamed; release obfuscation is not active")
+          print("R8 renamed MmkvManager ->", target)
+          PY
+          echo "Verified obfuscated APK: $APK"
 
       - name: Upload Phantom APK
         uses: actions/upload-artifact@v4
         with:
-          name: Phantom-Android-armeabi-v7a-Debug-APK
-          path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/apk/playstore/debug/*armeabi-v7a*.apk
+          name: Phantom-Android-armeabi-v7a-Release-APK
+          path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/apk/playstore/release/*armeabi-v7a*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload R8 mapping (keep private)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-R8-mapping-KEEP-PRIVATE
+          path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/mapping/playstoreRelease/mapping.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload generated keystore (keep private)
+        if: env.EPHEMERAL_KEYSTORE == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-signing-keystore-KEEP-PRIVATE
+          path: signing-out/*
           if-no-files-found: error
           retention-days: 14
