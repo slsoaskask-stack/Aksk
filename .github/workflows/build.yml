@@ -1,0 +1,40 @@
+name: Build v2rayNG
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unzip source
+        run: unzip -q master.zip
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+      - name: Build xray core
+        run: |
+          export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
+          mkdir -p $GITHUB_WORKSPACE/build && cd $GITHUB_WORKSPACE/build
+          git clone --depth=1 https://github.com/2dust/AndroidLibXrayLite.git
+          cd AndroidLibXrayLite
+          gomobile init
+          go mod tidy -v
+          gomobile bind -v -androidapi 21 -ldflags='-s -w' ./
+          mkdir -p $GITHUB_WORKSPACE/v2rayNG-master/V2rayNG/app/libs
+          cp *.aar $GITHUB_WORKSPACE/v2rayNG-master/V2rayNG/app/libs/
+      - name: Build APK
+        working-directory: v2rayNG-master/V2rayNG
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: v2rayNG-master/V2rayNG/app/build/outputs/apk/
