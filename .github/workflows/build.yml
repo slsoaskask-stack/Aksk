@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Unzip source
-        run: run: unzip -q v2rayNG-master.zip
+        run: unzip -q v2rayNG-master.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
