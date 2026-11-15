@@ -1,4 +1,4 @@
-name: Phantom v8.0 Release Build (from ZIP)
+name: Phantom ZEUS-Architecture Release Build (from ZIP)
 
 on:
   workflow_dispatch:
@@ -18,9 +18,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -s PHANTOM-v8.0-SOURCE.zip || { echo 'PHANTOM-v8.0-SOURCE.zip is missing from repository root'; exit 1; }
+          test -s PHANTOM-ZEUS-ARCH-SOURCE.zip || { echo 'PHANTOM-ZEUS-ARCH-SOURCE.zip is missing from repository root'; exit 1; }
           mkdir -p "$GITHUB_WORKSPACE/source"
-          unzip -q PHANTOM-v8.0-SOURCE.zip -d "$GITHUB_WORKSPACE/source"
+          unzip -q PHANTOM-ZEUS-ARCH-SOURCE.zip -d "$GITHUB_WORKSPACE/source"
           SRC_DIR="$GITHUB_WORKSPACE/source/PHANTOM-FINAL-SOURCE"
           test -d "$SRC_DIR/V2rayNG"
           test -s "$SRC_DIR/V2rayNG/app/src/main/assets/phantom-worker.js"
@@ -32,27 +32,59 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Minify and validate Cloudflare Worker
+      - name: Obfuscate and validate Cloudflare Worker
         shell: bash
         run: |
           set -euo pipefail
           cd "$PHANTOM_SRC_DIR/V2rayNG"
+          SOURCE="app/src/main/assets/phantom-worker.js"
+          OUTPUT="app/src/release/assets/phantom-worker.js"
           mkdir -p app/src/release/assets
-          npx --yes terser@5.51.2 app/src/main/assets/phantom-worker.js \
-            --module --compress passes=2 --mangle --format comments=false \
-            --output app/src/release/assets/phantom-worker.js
-          test -s app/src/release/assets/phantom-worker.js
-          cp app/src/release/assets/phantom-worker.js "$RUNNER_TEMP/phantom-worker.mjs"
-          node --check "$RUNNER_TEMP/phantom-worker.mjs"
-          python3 - app/src/release/assets/phantom-worker.js <<'PYCODE'
-          import pathlib, sys
+          python3 - "$SOURCE" <<'PYCODE'
+          import pathlib, re, sys
           source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-          required = ["/panel", "/health", "/api/state", "/api/users", "/api/settings", "/sub/", "/stream/", "cloudflare:sockets"]
+          required = ["/panel", "/health", "/api/state", "/api/users", "/api/settings", "/sub/", "/stream/", "cloudflare:sockets", "const Router", "const DbService", "const AuthService"]
           missing = [item for item in required if item not in source]
           if missing:
-              raise SystemExit("Worker release validation failed; missing markers: " + ", ".join(missing))
-          print(f"Worker release validated: {len(source)} bytes")
+              raise SystemExit("Worker source validation failed: " + ", ".join(missing))
+          if re.search(r"[\u0600-\u06ff]", source):
+              raise SystemExit("Worker source contains non-English UI/source text")
+          print(f"Worker source validated: {len(source)} bytes")
           PYCODE
+          npx --yes terser@5.51.2 "$SOURCE" \
+            --module --compress passes=2 --mangle --format comments=false \
+            --output "$RUNNER_TEMP/phantom-worker.min.mjs"
+          npx --yes javascript-obfuscator@5.10.1 "$RUNNER_TEMP/phantom-worker.min.mjs" \
+            --output "$OUTPUT" \
+            --target browser-no-eval \
+            --compact true \
+            --string-array true \
+            --string-array-encoding base64 \
+            --ignore-imports true \
+            --string-array-threshold 0.45 \
+            --identifier-names-generator hexadecimal \
+            --control-flow-flattening false \
+            --dead-code-injection false \
+            --rename-globals false \
+            --rename-properties false \
+            --self-defending false \
+            --debug-protection false \
+            --unicode-escape-sequence false
+          test -s "$OUTPUT"
+          cp "$OUTPUT" "$RUNNER_TEMP/phantom-worker.mjs"
+          node --check "$RUNNER_TEMP/phantom-worker.mjs"
+          python3 - "$OUTPUT" <<'PYCODE'
+          import pathlib, re, sys
+          source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          if re.search(r"[\u0600-\u06ff]", source):
+              raise SystemExit("Obfuscated Worker contains non-English text")
+          if re.search(r"\bnew\s+Function\s*\(|\beval\s*\(", source):
+              raise SystemExit("Dynamic code execution found in Worker output")
+          if "cloudflare:sockets" not in source or "export default" not in source:
+              raise SystemExit("Obfuscated module lost its Cloudflare entrypoint/import")
+          print(f"Obfuscated Worker validated: {len(source)} bytes")
+          PYCODE
+          PHANTOM_WORKER_SOURCE="$OUTPUT" node "$PHANTOM_SRC_DIR/tests/worker-smoke.mjs"
 
       - name: Setup Android SDK and NDK
         shell: bash
@@ -133,7 +165,7 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Prepare release keystore
+      - name: Prepare persistent release keystore
         shell: bash
         env:
           APP_KEYSTORE_BASE64: ${{ secrets.APP_KEYSTORE_BASE64 }}
@@ -142,25 +174,18 @@ jobs:
           APP_KEY_PASSWORD: ${{ secrets.APP_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          : "${APP_KEYSTORE_BASE64:?Set APP_KEYSTORE_BASE64 in GitHub Actions Secrets}"
+          : "${APP_KEYSTORE_PASSWORD:?Set APP_KEYSTORE_PASSWORD in GitHub Actions Secrets}"
+          : "${APP_KEYSTORE_ALIAS:?Set APP_KEYSTORE_ALIAS in GitHub Actions Secrets}"
+          : "${APP_KEY_PASSWORD:?Set APP_KEY_PASSWORD in GitHub Actions Secrets}"
           mkdir -p "$GITHUB_WORKSPACE/signing-out"
           KS="$GITHUB_WORKSPACE/signing-out/phantom.jks"
-          if [ -n "${APP_KEYSTORE_BASE64:-}" ]; then
-            printf '%s' "$APP_KEYSTORE_BASE64" | base64 -d > "$KS"
-            test -n "${APP_KEYSTORE_PASSWORD:-}" && test -n "${APP_KEYSTORE_ALIAS:-}" && test -n "${APP_KEY_PASSWORD:-}"
-            printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-              "$APP_KEYSTORE_PASSWORD" "$APP_KEYSTORE_ALIAS" "$APP_KEY_PASSWORD" \
-              > "$GITHUB_WORKSPACE/signing-out/keystore.props"
-            echo "EPHEMERAL_KEYSTORE=false" >> "$GITHUB_ENV"
-          else
-            STORE_PASS="$(openssl rand -base64 18 | tr -d '\n')"
-            keytool -genkeypair -keystore "$KS" -storepass "$STORE_PASS" -keypass "$STORE_PASS" \
-              -alias phantom -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Phantom, OU=Android, O=Phantom, L=NA, ST=NA, C=US"
-            printf 'storePassword=%s\nkeyAlias=phantom\nkeyPassword=%s\n' \
-              "$STORE_PASS" "$STORE_PASS" > "$GITHUB_WORKSPACE/signing-out/keystore.props"
-            echo "EPHEMERAL_KEYSTORE=true" >> "$GITHUB_ENV"
-            echo "WARNING: a temporary signing key was generated. Keep its artifact private; later updates require the same key."
-          fi
+          printf '%s' "$APP_KEYSTORE_BASE64" | base64 -d > "$KS"
+          test -s "$KS"
+          keytool -list -keystore "$KS" -storepass "$APP_KEYSTORE_PASSWORD" -alias "$APP_KEYSTORE_ALIAS" >/dev/null
+          printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$APP_KEYSTORE_PASSWORD" "$APP_KEYSTORE_ALIAS" "$APP_KEY_PASSWORD" \
+            > "$GITHUB_WORKSPACE/signing-out/keystore.props"
           echo "KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
 
       - name: Build Phantom armeabi-v7a release APK
@@ -218,12 +243,12 @@ jobs:
               sys.exit("MmkvManager was not renamed; release obfuscation is not active")
           print("R8 renamed MmkvManager ->", target)
           PYCODE
-          echo "Verified APK: $APK"
+          echo "Verified APK with an obfuscated Worker: $APK"
 
       - name: Upload Phantom APK
         uses: actions/upload-artifact@v4
         with:
-          name: Phantom-2.4.3-Android-armeabi-v7a-Release-APK
+          name: Phantom-2.4.4-ZEUS-Architecture-Android-armeabi-v7a-Release-APK
           path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/apk/playstore/release/*armeabi-v7a*.apk
           if-no-files-found: error
           retention-days: 14
@@ -236,11 +261,3 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload generated keystore (keep private)
-        if: env.EPHEMERAL_KEYSTORE == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Phantom-signing-keystore-KEEP-PRIVATE
-          path: signing-out/*
-          if-no-files-found: error
-          retention-days: 14
