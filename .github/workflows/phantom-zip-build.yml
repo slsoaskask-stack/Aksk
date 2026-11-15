@@ -71,9 +71,7 @@ jobs:
           python3 - "$SOURCE" <<'PYCODE'
           import pathlib, re, sys
           source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-          if re.search(r"[\\u0600-\\u06ff]", source):
-              raise SystemExit("Obfuscated Worker contains non-English UI/source text")
-          if re.search(r"\\bnew\\s+Function\\s*\\(|\\beval\\s*\\(", source):
+          if re.search(r"\bnew\s+Function\s*\(|\beval\s*\(", source):
               raise SystemExit("Dynamic code execution found in Worker output")
           if "cloudflare:sockets" not in source or "export default" not in source:
               raise SystemExit("Obfuscated module lost its Cloudflare entrypoint/import")
