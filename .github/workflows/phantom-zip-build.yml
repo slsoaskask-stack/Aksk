@@ -14,15 +14,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract uploaded source ZIP
+      - name: Locate and extract Phantom source ZIP
         shell: bash
         run: |
           set -euo pipefail
-          test -s PHANTOM-ZEUS-ARCH-SOURCE.zip || { echo 'PHANTOM-ZEUS-ARCH-SOURCE.zip is missing from repository root'; exit 1; }
+
+          ZIP_PATH=""
+          for candidate in \
+            "$GITHUB_WORKSPACE/PHANTOM-ZEUS-ARCH-SOURCE.zip" \
+            "$GITHUB_WORKSPACE/PHANTOM-ZEUS-ARCH-SOURCE-INTEGRATED.zip"; do
+            if [ -s "$candidate" ]; then ZIP_PATH="$candidate"; break; fi
+          done
+
+          if [ -z "$ZIP_PATH" ]; then
+            ZIP_PATH="$(find "$GITHUB_WORKSPACE" -type f \
+              \( -iname 'PHANTOM-ZEUS-ARCH-SOURCE-INTEGRATED.zip' \
+                 -o -iname 'PHANTOM-ZEUS-ARCH-SOURCE*.zip' \) \
+              -not -path '*/.git/*' -print -quit)"
+          fi
+
+          if [ -z "$ZIP_PATH" ] || [ ! -s "$ZIP_PATH" ]; then
+            echo "ERROR: No Phantom source ZIP was committed to this repository."
+            echo "ZIP files visible to GitHub Actions:"
+            find "$GITHUB_WORKSPACE" -type f -iname '*.zip' -not -path '*/.git/*' -print || true
+            echo "Repository root contents:"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+
+          echo "Using source archive: ${ZIP_PATH#"$GITHUB_WORKSPACE"/}"
           mkdir -p "$GITHUB_WORKSPACE/source"
-          unzip -q PHANTOM-ZEUS-ARCH-SOURCE.zip -d "$GITHUB_WORKSPACE/source"
+          unzip -q "$ZIP_PATH" -d "$GITHUB_WORKSPACE/source"
           SRC_DIR="$GITHUB_WORKSPACE/source/PHANTOM-FINAL-SOURCE"
-          test -d "$SRC_DIR/V2rayNG"
+          test -d "$SRC_DIR/V2rayNG" || { echo "Invalid source ZIP: PHANTOM-FINAL-SOURCE/V2rayNG not found"; exit 1; }
           test -s "$SRC_DIR/V2rayNG/app/src/main/assets/phantom-worker.js"
           test -s "$SRC_DIR/compile-hevtun.sh"
           echo "PHANTOM_SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
