@@ -1,4 +1,4 @@
-name: Phantom ZEUS-Architecture Release Build (from ZIP)
+name: Phantom ZEUS-Architecture Debug Build (from ZIP)
 
 on:
   workflow_dispatch:
@@ -165,51 +165,20 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Prepare persistent release keystore
-        shell: bash
-        env:
-          APP_KEYSTORE_BASE64: ${{ secrets.APP_KEYSTORE_BASE64 }}
-          APP_KEYSTORE_PASSWORD: ${{ secrets.APP_KEYSTORE_PASSWORD }}
-          APP_KEYSTORE_ALIAS: ${{ secrets.APP_KEYSTORE_ALIAS }}
-          APP_KEY_PASSWORD: ${{ secrets.APP_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          : "${APP_KEYSTORE_BASE64:?Set APP_KEYSTORE_BASE64 in GitHub Actions Secrets}"
-          : "${APP_KEYSTORE_PASSWORD:?Set APP_KEYSTORE_PASSWORD in GitHub Actions Secrets}"
-          : "${APP_KEYSTORE_ALIAS:?Set APP_KEYSTORE_ALIAS in GitHub Actions Secrets}"
-          : "${APP_KEY_PASSWORD:?Set APP_KEY_PASSWORD in GitHub Actions Secrets}"
-          mkdir -p "$GITHUB_WORKSPACE/signing-out"
-          KS="$GITHUB_WORKSPACE/signing-out/phantom.jks"
-          printf '%s' "$APP_KEYSTORE_BASE64" | base64 -d > "$KS"
-          test -s "$KS"
-          keytool -list -keystore "$KS" -storepass "$APP_KEYSTORE_PASSWORD" -alias "$APP_KEYSTORE_ALIAS" >/dev/null
-          printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
-            "$APP_KEYSTORE_PASSWORD" "$APP_KEYSTORE_ALIAS" "$APP_KEY_PASSWORD" \
-            > "$GITHUB_WORKSPACE/signing-out/keystore.props"
-          echo "KEYSTORE_FILE=$KS" >> "$GITHUB_ENV"
-
-      - name: Build Phantom armeabi-v7a release APK
+      - name: Build Phantom armeabi-v7a debug APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$PHANTOM_SRC_DIR/V2rayNG"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
-          PROPS="$GITHUB_WORKSPACE/signing-out/keystore.props"
-          STORE_PASS="$(sed -n 's/^storePassword=//p' "$PROPS")"
-          KEY_ALIAS="$(sed -n 's/^keyAlias=//p' "$PROPS")"
-          KEY_PASS="$(sed -n 's/^keyPassword=//p' "$PROPS")"
-          ./gradlew --no-daemon :app:assemblePlaystoreRelease -PABI_FILTERS=armeabi-v7a \
-            -Pandroid.injected.signing.store.file="$KEYSTORE_FILE" \
-            -Pandroid.injected.signing.store.password="$STORE_PASS" \
-            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
-            -Pandroid.injected.signing.key.password="$KEY_PASS"
+          ./gradlew --no-daemon :app:assemblePlaystoreDebug -PABI_FILTERS=armeabi-v7a
 
-      - name: Verify APK libraries, embedded Worker and R8 obfuscation
+      - name: Verify APK libraries and embedded Worker
         shell: bash
         run: |
           set -euo pipefail
-          APK=$(find "$PHANTOM_SRC_DIR/V2rayNG/app/build/outputs/apk/playstore/release" -maxdepth 1 -type f -name '*armeabi-v7a*.apk' | head -n 1)
+          APK=$(find "$PHANTOM_SRC_DIR/V2rayNG/app/build/outputs/apk/playstore/debug" -maxdepth 1 -type f -name '*.apk' | head -n 1)
           test -n "$APK"
           unzip -Z1 "$APK" | grep -Fx 'lib/armeabi-v7a/libhev-socks5-tunnel.so'
           unzip -Z1 "$APK" | grep -Fx 'lib/armeabi-v7a/libhevsockstun.so'
@@ -230,34 +199,12 @@ jobs:
               raise SystemExit("Embedded Worker missing expected capabilities: " + ", ".join(missing))
           print(f"Embedded Worker verified: {len(source)} bytes")
           PYCODE
-          MAP="$PHANTOM_SRC_DIR/V2rayNG/app/build/outputs/mapping/playstoreRelease/mapping.txt"
-          test -s "$MAP"
-          python3 - "$MAP" <<'PYCODE'
-          import sys
-          text = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
-          renamed = [line for line in text if line.startswith("com.v2ray.ang.handler.MmkvManager -> ")]
-          if not renamed:
-              sys.exit("R8 mapping has no MmkvManager entry; minify did not run")
-          target = renamed[0].split("->", 1)[1].strip().rstrip(":")
-          if target == "com.v2ray.ang.handler.MmkvManager":
-              sys.exit("MmkvManager was not renamed; release obfuscation is not active")
-          print("R8 renamed MmkvManager ->", target)
-          PYCODE
-          echo "Verified APK with an obfuscated Worker: $APK"
+          echo "Verified debug APK: $APK"
 
-      - name: Upload Phantom APK
+      - name: Upload Phantom Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: Phantom-2.4.4-ZEUS-Architecture-Android-armeabi-v7a-Release-APK
-          path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/apk/playstore/release/*armeabi-v7a*.apk
+          name: Phantom-Debug-APK-armeabi-v7a
+          path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/apk/playstore/debug/*.apk
           if-no-files-found: error
           retention-days: 14
-
-      - name: Upload R8 mapping (keep private)
-        uses: actions/upload-artifact@v4
-        with:
-          name: Phantom-R8-mapping-KEEP-PRIVATE
-          path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/mapping/playstoreRelease/mapping.txt
-          if-no-files-found: error
-          retention-days: 14
-
