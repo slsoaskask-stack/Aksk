@@ -1,0 +1,163 @@
+name: Phantom Cloudflare Worker Obfuscation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  obfuscate-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Phantom source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s PHANTOM-ZEUS-ARCH-SOURCE.zip || { echo 'PHANTOM-ZEUS-ARCH-SOURCE.zip is missing from repository root'; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/source"
+          unzip -q PHANTOM-ZEUS-ARCH-SOURCE.zip -d "$GITHUB_WORKSPACE/source"
+          SRC="$GITHUB_WORKSPACE/source/PHANTOM-FINAL-SOURCE/V2rayNG/app/src/main/assets/phantom-worker.js"
+          test -s "$SRC"
+          echo "PHANTOM_WORKER_SOURCE=$SRC" >> "$GITHUB_ENV"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pinned obfuscation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOL_DIR="$RUNNER_TEMP/phantom-obfuscation-tools"
+          npm install --prefix "$TOOL_DIR" --no-audit --no-fund --no-save \
+            terser@5.51.2 javascript-obfuscator@5.10.1
+          echo "PHANTOM_TOOL_BIN=$TOOL_DIR/node_modules/.bin" >> "$GITHUB_ENV"
+
+      - name: Obfuscate panel browser scripts and Worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist "$RUNNER_TEMP/phantom-inline"
+          python3 - "$PHANTOM_WORKER_SOURCE" "$RUNNER_TEMP/phantom-inline" "$PHANTOM_TOOL_BIN" "$(command -v node)" <<'PYCODE'
+          import pathlib, re, subprocess, sys
+
+          worker_path = pathlib.Path(sys.argv[1])
+          temp_dir = pathlib.Path(sys.argv[2])
+          tool_bin = pathlib.Path(sys.argv[3])
+          node = sys.argv[4]
+          source = worker_path.read_text(encoding="utf-8")
+
+          def run(args):
+              subprocess.run([str(x) for x in args], check=True)
+
+          def obfuscate_script(script, index):
+              if not script.strip():
+                  return script
+              raw = temp_dir / f"inline-{index}.js"
+              mini = temp_dir / f"inline-{index}.min.js"
+              final = temp_dir / f"inline-{index}.obfuscated.js"
+              raw.write_text(script, encoding="utf-8")
+              run([tool_bin / "terser", raw, "--compress", "passes=2", "--mangle", "--format", "comments=false", "--output", mini])
+              run([
+                  tool_bin / "javascript-obfuscator", mini, "--output", final,
+                  "--target", "browser-no-eval", "--compact", "true",
+                  "--string-array", "true", "--string-array-encoding", "base64",
+                  "--string-array-threshold", "0.45",
+                  "--identifier-names-generator", "hexadecimal",
+                  "--control-flow-flattening", "false", "--dead-code-injection", "false",
+                  "--rename-globals", "false", "--rename-properties", "false",
+                  "--self-defending", "false", "--debug-protection", "false",
+                  "--unicode-escape-sequence", "false"
+              ])
+              run([node, "--check", final])
+              return final.read_text(encoding="utf-8")
+
+          script_pattern = re.compile(r"(<script\b[^>]*>)([\s\S]*?)(</script>)", re.IGNORECASE)
+          transformed_count = 0
+          for constant in ("LOGIN_HTML", "DASHBOARD_HTML"):
+              template_pattern = re.compile(rf"(const\s+{constant}\s*=\s*`)([\s\S]*?)(`;\s*)")
+              match = template_pattern.search(source)
+              if not match:
+                  raise SystemExit(f"Could not locate {constant} template")
+              html = match.group(2)
+
+              def replace_script(script_match):
+                  global transformed_count
+                  transformed_count += 1
+                  return script_match.group(1) + obfuscate_script(script_match.group(2), transformed_count) + script_match.group(3)
+
+              updated_html = script_pattern.sub(replace_script, html)
+              if updated_html == html and constant == "DASHBOARD_HTML":
+                  raise SystemExit("No dashboard JavaScript blocks were found")
+              source = source[:match.start(2)] + updated_html + source[match.end(2):]
+
+          if transformed_count < 3:
+              raise SystemExit(f"Expected at least 3 panel browser scripts; transformed {transformed_count}")
+
+          out_path = pathlib.Path("dist") / "phantom-worker-panel-scripts-obfuscated.js"
+          out_path.parent.mkdir(parents=True, exist_ok=True)
+          out_path.write_text(source, encoding="utf-8")
+          print(f"Panel browser scripts obfuscated: {transformed_count}")
+          print(f"Prepared Worker source: {len(source.encode('utf-8'))} bytes")
+          PYCODE
+
+          # Minify and obfuscate the complete Worker module after its embedded panel scripts.
+          "$PHANTOM_TOOL_BIN/terser" dist/phantom-worker-panel-scripts-obfuscated.js \
+            --module --compress passes=2 --mangle --format comments=false \
+            --output "$RUNNER_TEMP/phantom-worker.min.mjs"
+          "$PHANTOM_TOOL_BIN/javascript-obfuscator" "$RUNNER_TEMP/phantom-worker.min.mjs" \
+            --output dist/phantom-worker-cloudflare-obfuscated.js \
+            --target browser-no-eval --compact true \
+            --string-array true --string-array-encoding base64 --string-array-threshold 0.45 \
+            --identifier-names-generator hexadecimal \
+            --control-flow-flattening false --dead-code-injection false \
+            --rename-globals false --rename-properties false \
+            --self-defending false --debug-protection false --unicode-escape-sequence false
+
+          test -s dist/phantom-worker-cloudflare-obfuscated.js
+          cp dist/phantom-worker-cloudflare-obfuscated.js "$RUNNER_TEMP/phantom-worker-cloudflare-obfuscated.mjs"
+          node --check "$RUNNER_TEMP/phantom-worker-cloudflare-obfuscated.mjs"
+          python3 - dist/phantom-worker-cloudflare-obfuscated.js <<'PYCODE'
+          import pathlib, re, sys
+          p = pathlib.Path(sys.argv[1])
+          s = p.read_text(encoding="utf-8")
+          if "cloudflare:sockets" not in s or "export default" not in s:
+              raise SystemExit("Cloudflare module import/entrypoint validation failed")
+          if re.search(r"\bnew\s+Function\s*\(|\beval\s*\(", s):
+              raise SystemExit("Dynamic code execution was found in obfuscated output")
+          print(f"Cloudflare Worker output validated: {len(s.encode('utf-8'))} bytes")
+          PYCODE
+
+      - name: Run Worker smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          PHANTOM_WORKER_SOURCE="$GITHUB_WORKSPACE/dist/phantom-worker-cloudflare-obfuscated.js" \
+            node "$GITHUB_WORKSPACE/source/PHANTOM-FINAL-SOURCE/tests/worker-smoke.mjs"
+
+      - name: Prepare deployment note
+        shell: bash
+        run: |
+          cat > dist/DEPLOY-TO-CLOUDFLARE.txt <<'TXT'
+          1. Open the EXISTING Phantom Worker in Cloudflare Dashboard.
+          2. Back up its current source code before replacing anything.
+          3. Open Edit code / Quick edit and replace the complete module with phantom-worker-cloudflare-obfuscated.js.
+          4. Save and Deploy the EXISTING Worker; do not create a new Worker.
+          5. Keep the existing D1 binding named DB and existing secrets/variables unchanged.
+          6. Test /health, /panel, sign-in, Create Profile, profile update/delete, and subscriptions.
+          If anything fails, restore the backed-up source immediately.
+          TXT
+
+      - name: Upload obfuscated Cloudflare Worker
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phantom-Cloudflare-Worker-Obfuscated
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
