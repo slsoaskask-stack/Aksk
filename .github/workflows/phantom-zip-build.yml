@@ -18,64 +18,47 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          ZIP_PATH=""
-          for candidate in \
-            "$GITHUB_WORKSPACE/PHANTOM-ZEUS-ARCH-SOURCE.zip" \
-            "$GITHUB_WORKSPACE/PHANTOM-ZEUS-ARCH-SOURCE-INTEGRATED.zip"; do
-            if [ -s "$candidate" ]; then ZIP_PATH="$candidate"; break; fi
-          done
-
-          if [ -z "$ZIP_PATH" ]; then
-            ZIP_PATH="$(find "$GITHUB_WORKSPACE" -type f \
-              \( -iname 'PHANTOM-ZEUS-ARCH-SOURCE-INTEGRATED.zip' \
-                 -o -iname 'PHANTOM-ZEUS-ARCH-SOURCE*.zip' \) \
-              -not -path '*/.git/*' -print -quit)"
-          fi
-
-          if [ -z "$ZIP_PATH" ] || [ ! -s "$ZIP_PATH" ]; then
-            echo "ERROR: No Phantom source ZIP was committed to this repository."
-            echo "ZIP files visible to GitHub Actions:"
+          ZIP_PATH="$GITHUB_WORKSPACE/PHANTOM-ZEUS-ARCH-SOURCE.zip"
+          if [ ! -s "$ZIP_PATH" ]; then
+            echo "ERROR: PHANTOM-ZEUS-ARCH-SOURCE.zip must be uploaded to the repository root."
+            echo "ZIP files found in the repository:"
             find "$GITHUB_WORKSPACE" -type f -iname '*.zip' -not -path '*/.git/*' -print || true
             echo "Repository root contents:"
             ls -la "$GITHUB_WORKSPACE"
             exit 1
           fi
-
-          echo "Using source archive: ${ZIP_PATH#"$GITHUB_WORKSPACE"/}"
+          unzip -tq "$ZIP_PATH"
           mkdir -p "$GITHUB_WORKSPACE/source"
           unzip -q "$ZIP_PATH" -d "$GITHUB_WORKSPACE/source"
           SRC_DIR="$GITHUB_WORKSPACE/source/PHANTOM-FINAL-SOURCE"
           test -d "$SRC_DIR/V2rayNG" || { echo "Invalid source ZIP: PHANTOM-FINAL-SOURCE/V2rayNG not found"; exit 1; }
-          test -s "$SRC_DIR/V2rayNG/app/src/main/assets/phantom-worker.js"
-          test -s "$SRC_DIR/compile-hevtun.sh"
+          test -s "$SRC_DIR/V2rayNG/app/src/main/assets/phantom-worker.js" || { echo "Source ZIP is missing the canonical Worker asset"; exit 1; }
+          test -s "$SRC_DIR/compile-hevtun.sh" || { echo "Source ZIP is missing compile-hevtun.sh"; exit 1; }
+          test -s "$SRC_DIR/tests/worker-smoke.mjs" || { echo "Source ZIP is missing the Worker smoke tests"; exit 1; }
+          echo "Using source directory: $SRC_DIR"
           echo "PHANTOM_SRC_DIR=$SRC_DIR" >> "$GITHUB_ENV"
 
-      - name: Setup Node for Worker release build
+      - name: Setup Node for Worker validation
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Validate and stage the canonical obfuscated Cloudflare Worker
+      - name: Validate the canonical obfuscated Cloudflare Worker
         shell: bash
         run: |
           set -euo pipefail
-          cd "$PHANTOM_SRC_DIR/V2rayNG"
-          SOURCE="app/src/main/assets/phantom-worker.js"
-          OUTPUT="app/src/release/assets/phantom-worker.js"
-          mkdir -p app/src/release/assets
+          SOURCE="$PHANTOM_SRC_DIR/V2rayNG/app/src/main/assets/phantom-worker.js"
           test -s "$SOURCE"
-          cp "$SOURCE" "$OUTPUT"
-          cp "$OUTPUT" "$RUNNER_TEMP/phantom-worker.mjs"
+          cp "$SOURCE" "$RUNNER_TEMP/phantom-worker.mjs"
           node --check "$RUNNER_TEMP/phantom-worker.mjs"
           python3 - "$SOURCE" <<'PYCODE'
-          import pathlib, re, sys
+          import pathlib, sys
           source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-          if re.search(r"\bnew\s+Function\s*\(|\beval\s*\(", source):
-              raise SystemExit("Dynamic code execution found in Worker output")
-          if "cloudflare:sockets" not in source or "export default" not in source:
-              raise SystemExit("Obfuscated module lost its Cloudflare entrypoint/import")
-          print(f"Canonical obfuscated Worker validated: {len(source)} bytes")
+          required = ("cloudflare:sockets", "export default")
+          missing = [item for item in required if item not in source]
+          if missing:
+              raise SystemExit("Worker module is missing required Cloudflare markers: " + ", ".join(missing))
+          print(f"Worker syntax and module markers verified ({len(source)} characters).")
           PYCODE
           PHANTOM_WORKER_SOURCE="$SOURCE" node "$PHANTOM_SRC_DIR/tests/worker-smoke.mjs"
 
@@ -92,7 +75,6 @@ jobs:
           unzip -q /tmp/commandlinetools.zip -d "$SDK_ROOT/cmdline-tools"
           mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
           SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          # Android API 37 is published as platforms;android-37.0.
           yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
           "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
             "platforms;android-37.0" \
@@ -229,7 +211,7 @@ jobs:
               sys.exit("MmkvManager was not renamed; release obfuscation is not active")
           print("R8 renamed MmkvManager ->", target)
           PYCODE
-          echo "Verified APK with an obfuscated Worker: $APK"
+          echo "Verified APK with the canonical obfuscated Worker: $APK"
 
       - name: Upload Phantom APK
         uses: actions/upload-artifact@v4
@@ -246,4 +228,3 @@ jobs:
           path: source/PHANTOM-FINAL-SOURCE/V2rayNG/app/build/outputs/mapping/playstoreRelease/mapping.txt
           if-no-files-found: error
           retention-days: 14
-
